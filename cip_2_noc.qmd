@@ -1,0 +1,162 @@
+---
+title: "Relationship between post secondary graduates and job openings"
+author: "Richard Martin"
+format:
+  html:
+    code-fold: true
+    page-layout: full
+---
+
+```{r, include=FALSE}
+library(tidyverse)
+library(here)
+library(qdapRegex)
+library(conflicted)
+conflicts_prefer(dplyr::filter)
+```
+
+```{r, cache=TRUE, message=FALSE}
+#constants----------------------
+letters <- "[:alpha:]"
+#functions------------------------------
+apply_props <- function(tbbl, val){
+  tbbl|>
+    mutate(count=prop*val)
+}
+my_dt <- function(tbbl) {
+  DT::datatable(tbbl,
+    filter = 'top',
+    extensions = "Buttons",
+    rownames = FALSE,
+    options = list(
+      columnDefs = list(list(className = "dt-center", targets = "_all")),
+      paging = TRUE,
+      scrollX = TRUE,
+      scrollY = TRUE,
+      searching = TRUE,
+      ordering = TRUE,
+      dom = "Btip",
+      buttons = list(
+        list(extend = "csv", filename = "some_file_name"),
+        list(extend = "excel", filename = "some_file_name")
+      ),
+      pageLength = 20
+    )
+  )
+}
+#read in the data-------------------------------------
+
+cip_counts_col_names <- unlist(as.vector(read_csv(here("data","cip_counts_bc.csv"), skip=12, n_max = 1, col_names = FALSE)))
+names(cip_counts_col_names) <- NULL
+
+cip_counts <- read_csv(here("data","cip_counts_bc.csv"), skip=14, na = "..", col_names = cip_counts_col_names)|>
+  mutate(CIP=ex_between(`Field of study 5`,"[","]"),
+         CIP=str_remove_all(CIP, letters),
+         CIP=str_pad(CIP, width=5, side = "left", pad = "0"),
+         field_of_study=word(`Field of study 5`, sep="\\["), .before = everything())|>
+  select(-`Field of study 5`)|>
+  pivot_longer(cols = starts_with("2"))|>
+  group_by(CIP, field_of_study)|>
+  summarise(new_grads_2010_2021=sum(value, na.rm = TRUE))
+
+cip_noc <- vroom::vroom(here("data","cip_2_noc_canada.csv"), skip = 13)[-1,]
+colnames(cip_noc)[1] <- "field_of_study"
+
+#process the data------------------------------------
+
+tbbl <- cip_noc|>
+  janitor::remove_empty("cols")|>
+  pivot_longer(cols=-field_of_study, names_to = "noc", values_to = "count")|>
+  mutate(count=as.numeric(str_remove_all(count,",")))|>
+  group_by(field_of_study)|>
+  mutate(prop=count/sum(count, na.rm = TRUE))|>
+  select(-count)|>
+  nest()|>
+  mutate(CIP=str_sub(field_of_study, 1, 5),
+         field_of_study=str_sub(field_of_study, 7))|>
+  inner_join(cip_counts, by="CIP")|>
+  arrange(desc(new_grads_2010_2021))|>
+  mutate(data=map2(data, new_grads_2010_2021, apply_props))|>
+  select(data)|>
+  unnest(data)|>
+  group_by(noc)|>
+  summarize(`new entrants`=sum(count, na.rm = TRUE))|>
+  ungroup()|>
+  mutate(`new entrants %`=`new entrants`/sum(`new entrants`))
+
+#job openings---------------------
+
+jo <- readxl::read_excel(here("data","job_openings_occupation.xlsx"), skip = 3)|>
+  janitor::remove_constant()|>
+  filter(NOC!="#T",
+         Variable=="Job Openings",
+         `Geographic Area`=="British Columbia"
+         )|>
+  select(-Variable, -`Geographic Area`)|>
+  mutate(NOC=str_remove(NOC,"#"))|>
+  unite("noc", NOC, Description, sep=" ")|>
+  pivot_longer(cols = starts_with("2"))|>
+  group_by(noc)|>
+  summarize(`job openings`=sum(value, na.rm = TRUE))|>
+  ungroup()|>
+  mutate(`job openings %`=`job openings`/sum(`job openings`, na.rm = TRUE))
+
+joined <- inner_join(tbbl, jo)|>
+  mutate(`excess demand %`=`job openings %`-`new entrants %`)
+
+plt <- ggplot(joined, aes(`new entrants %`,
+                          `job openings %`,
+                          text=noc))+
+  geom_abline(slope = 1, intercept = 0, lwd=2, col="white")+
+  geom_point(alpha=.25)+
+  scale_x_continuous(trans="log10", labels = scales::percent)+
+  scale_y_continuous(trans="log10", labels = scales::percent)+
+  labs(title="Above the diagonal suggests relative shortage, below relative surplus",
+       x="Proportion of New Entrants by NOC",
+       y="Proportion of total job openings by NOC")
+
+plt2 <- joined|>
+  slice_max(order_by = abs(`excess demand %`), n=40)|>
+  ggplot(aes(`excess demand %`, fct_reorder(noc,`excess demand %`), text=noc))+
+  geom_col(alpha=.5)+
+  theme_minimal()+
+  scale_x_continuous(labels = scales::percent)+
+  labs(title="Top 40 NOCs with greatest (proportional) demand-supply differences",
+       y=NULL, 
+       x="Excess supply                  |            Excess demand")
+```
+
+
+
+## Introduction
+
+Statistics Canada table 37-10-0183-01 provides counts of post secondary graduates by detailed field of study (CIP counts), whereas table 98-10-0403-01 provides counts of employment by detailed field of study and occupation (CIP-NOC counts).  From the CIP-NOC counts we can derive proportions for each CIP:  for a given field of study what proportion of graduates (historically) have ended up in occupation $X$.  We can then apply these proportions to the post secondary graduate counts, yielding a prediction of occupation choice.  When summed across all fields of study this represents a prediction of the supply of new entrants by occupation.
+
+We can contrast this predicted supply with predicted job openings from the 2023 LMO.  Because the time frames of the post secondary graduates (2010-2021) and the LMO differ (2022-2033), we look at proportions rather than absolute values. i.e. To what extent are the (historic) supply proportions in line with the (forecast) demand proportions?
+
+```{r, fig.height=8, warning=FALSE}
+plotly::ggplotly(plt, tooltip = "text")
+```
+
+Optometrist and Veterinarians appear to be outliers, lets look a bit closer at the counts of post secondary graduates by detailed field of study to see what is going on (type in Optometry in the filter box below.) Looks like a missing data problem...  Indeed, there are over 100 fields of study where the ten year total new grads were 0.
+
+```{r}
+my_dt(cip_counts|>arrange(new_grads_2010_2021))
+```
+
+Note that the scatter plot above is displayed on log10 scale, which accentuates the differences for minor occupations, like optometrists.  Now lets look for the largest difference in proportions between supply (new graduates) and demand (job openings).
+
+```{r, fig.height=8, warning=FALSE}
+plotly::ggplotly(plt2, tooltip = "text")|>
+  plotly::config(displayModeBar = FALSE)
+```
+
+## The data:
+
+```{r}
+my_dt(joined)|>
+  DT::formatRound(columns=c('new entrants', 'job openings'), digits=0)|>
+  DT::formatPercentage(columns=c("new entrants %","job openings %","excess demand %"), digits=3)
+```
+
+
